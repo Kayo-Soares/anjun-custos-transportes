@@ -1,0 +1,25 @@
+# Dados sensíveis — NÃO subir custos reais da empresa para o GitHub
+*.xlsx
+*.xlsm
+!exemplo/*.xlsx
+resumo_custos_transporte.xlsx
+base_consolidada_transporte.csv
+
+# Saídas geradas pelo app
+charts/
+*.png
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+*.egg-info/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Sistema
+.DS_Store
+Thumbs.db
