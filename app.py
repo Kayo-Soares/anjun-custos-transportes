@@ -13,6 +13,7 @@ Como rodar:
 
 import glob
 import os
+import re
 
 import pandas as pd
 import plotly.express as px
@@ -157,12 +158,28 @@ def localizar_arquivos_na_pasta() -> list[str]:
 
 
 # ----------------------------------------------------------------------
-# 2b. PROGRAMAÇÃO DE TRANSFERÊNCIA (planilha de estrutura diferente:
-#     blocos por estação, sem cabeçalho fixo — precisa de parser próprio)
+# 2b. PROGRAMAÇÃO DE TRANSFERÊNCIA (planilha de estrutura irregular:
+#     blocos por estação, cabeçalho lido dinamicamente pelas etiquetas —
+#     resiliente a mudanças de template, como a inclusão de novas colunas)
 # ----------------------------------------------------------------------
-DIAS_SEMANA = ["seg", "ter", "qua", "qui", "sex", "sab", "dom"]
-DIAS_LABEL = {"seg": "Seg", "ter": "Ter", "qua": "Qua", "qui": "Qui",
-              "sex": "Sex", "sab": "Sáb", "dom": "Dom"}
+DIAS_LABEL = {"SEG": "Seg", "TER": "Ter", "QUA": "Qua", "QUI": "Qui",
+              "SEX": "Sex", "SAB": "Sáb", "DOM": "Dom"}
+MODO_ICONE = {"RODOVIARIO": "🚛", "RODOFLUVIAL": "🚢", "AEREO": "✈️", "FLUVIAL": "🚢"}
+
+
+def parse_tempo_horas(texto):
+    """Converte '6 HORAS', '1 HORA' ou '1:30 HORAS' em número de horas (float).
+    Retorna None se o texto não for um formato de duração reconhecido
+    (ex: observações como 'COLETA DSP')."""
+    if pd.isna(texto):
+        return None
+    s = str(texto).strip().upper()
+    m = re.match(r"^(\d+)(?::(\d{1,2}))?\s*HORAS?$", s)
+    if not m:
+        return None
+    horas = int(m.group(1))
+    minutos = int(m.group(2)) if m.group(2) else 0
+    return horas + minutos / 60
 
 
 @st.cache_data(show_spinner="Lendo programação de transferência...")
@@ -171,32 +188,76 @@ def carregar_programacao(arquivo) -> pd.DataFrame:
 
     registros = []
     estacao_atual = None
-    for i in range(len(raw)):
+    header_map, dia_cols = None, None
+    i, n = 0, len(raw)
+
+    while i < n:
         row = raw.iloc[i]
-        # Cabeçalho de bloco: coluna 0 preenchida e colunas 1-12 todas vazias
-        if pd.notna(row[0]) and row[1:13].isna().all() and str(row[0]).strip().upper() != "ROTA":
-            estacao_atual = str(row[0]).strip()
+        primeira = row[0]
+
+        # Cabeçalho de bloco (nome da estação): col0 preenchida, resto da linha vazia
+        if pd.notna(primeira) and row[1:].isna().all():
+            estacao_atual = str(primeira).strip()
+            header_map, dia_cols = None, None
+            i += 1
             continue
-        # Linha de dados: coluna 0 é um número de rota, dentro de um bloco já identificado
-        if estacao_atual and pd.notna(row[0]):
+
+        # Cabeçalho de colunas: primeira célula é literalmente "ROTA"
+        if pd.notna(primeira) and str(primeira).strip().upper() == "ROTA":
+            header_map = {}
+            for col_idx, val in enumerate(row):
+                if pd.notna(val):
+                    header_map[str(val).strip().upper()] = col_idx
+            sub = raw.iloc[i + 1]  # subcabeçalho com SEG..DOM
+            dia_cols = {}
+            for col_idx, val in enumerate(sub):
+                if pd.notna(val):
+                    dia_cols[str(val).strip().upper()] = col_idx
+            i += 2
+            continue
+
+        # Linha de dados: coluna 0 é um número de rota
+        if estacao_atual and header_map and pd.notna(primeira):
             try:
-                rota_num = int(row[0])
+                rota_num = int(primeira)
             except (ValueError, TypeError):
+                i += 1
                 continue
+
+            def pegar(*labels, default=None):
+                for lbl in labels:
+                    if lbl in header_map:
+                        return row[header_map[lbl]]
+                return default
+
+            tempo_txt = pegar("TEMPO DE VIAGEM", "OBS")
             reg = {
                 "estacao": estacao_atual,
                 "rota": rota_num,
-                "tipo_operacao": row[1],
-                "estacao_partida": row[2],
-                "iata_percurso": row[3],
-                "horario_saida": row[4],
-                "obs": row[12] if len(row) > 12 else None,
+                "tipo_operacao": pegar("RESPONSAVEL OP", "TIPO DE OPERAÇÃO"),
+                "modo_operacao": pegar("MODO DE OP"),
+                "estacao_partida": pegar("ESTAÇÃO DE PARTIDA"),
+                "iata_percurso": pegar("IATA PERCURSO"),
+                "horario_saida": pegar("HORARIO SAIDA"),
+                "tempo_viagem_txt": tempo_txt,
+                "tempo_viagem_horas": parse_tempo_horas(tempo_txt),
             }
-            for idx, dia in enumerate(DIAS_SEMANA):
-                reg[dia] = pd.notna(row[5 + idx])
+            for dia_label, dia_col in dia_cols.items():
+                if dia_label in DIAS_LABEL:
+                    reg[dia_label.lower()] = pd.notna(row[dia_col])
             registros.append(reg)
 
-    return pd.DataFrame(registros)
+        i += 1
+
+    df = pd.DataFrame(registros)
+    if not df.empty:
+        for c in ["tipo_operacao", "modo_operacao", "estacao_partida", "iata_percurso"]:
+            if c in df.columns:
+                df[c] = df[c].astype(str).str.strip().replace({"nan": pd.NA, "None": pd.NA})
+    return df
+
+
+DIAS_SEMANA = [d.lower() for d in DIAS_LABEL]
 
 
 def localizar_arquivo_programacao_na_pasta():
@@ -520,47 +581,77 @@ with tab_programacao:
         estacoes = sorted(prog_df["estacao"].unique())
         estacao_sel = st.selectbox("Estação | 站点", estacoes)
 
-        dados_estacao = prog_df[prog_df["estacao"] == estacao_sel].sort_values("rota")
+        dados_estacao = prog_df[prog_df["estacao"] == estacao_sel].sort_values("rota").copy()
 
-        # rótulo de cada rota, combinando número + tipo de operação + percurso
-        dados_estacao = dados_estacao.copy()
-        dados_estacao["rota_label"] = dados_estacao.apply(
-            lambda r: f"Rota {r['rota']} · {r['tipo_operacao']} · {r['iata_percurso']}", axis=1
-        )
+        # rótulo de cada rota, com ícone do modo de operação (quando disponível)
+        def montar_rota_label(r):
+            icone = MODO_ICONE.get(str(r["modo_operacao"]).strip().upper(), "")
+            prefixo = f"{icone} " if icone else ""
+            return f"{prefixo}Rota {r['rota']} · {r['tipo_operacao']} · {r['iata_percurso']}"
 
-        # ---- Heatmap semanal (dias ativos por rota) ----
-        matriz = dados_estacao.set_index("rota_label")[DIAS_SEMANA].astype(int)
-        matriz.columns = [DIAS_LABEL[d] for d in DIAS_SEMANA]
+        dados_estacao["rota_label"] = dados_estacao.apply(montar_rota_label, axis=1)
+        tem_modo = dados_estacao["modo_operacao"].notna().any()
+        tem_tempo = dados_estacao["tempo_viagem_horas"].notna().any()
 
-        hover_horario = dados_estacao.set_index("rota_label")["horario_saida"].astype(str)
+        col_a, col_b = st.columns([1.3, 1]) if tem_tempo else (st.container(), None)
 
-        fig = go.Figure(data=go.Heatmap(
-            z=matriz.values,
-            x=matriz.columns,
-            y=matriz.index,
-            colorscale=[[0, "#F2F3F1"], [1, COR_PRIMARIA_CLARA]],
-            showscale=False,
-            xgap=4, ygap=4,
-            hovertemplate="<b>%{y}</b><br>Dia: %{x}<br>Ativo: %{z}<extra></extra>",
-        ))
-        fig.update_layout(
-            title=dict(text=f"Grade Semanal — {estacao_sel} | 每周计划", font=dict(size=14, color=COR_PRIMARIA)),
-            height=120 + 40 * len(matriz),
-            margin=dict(l=0, r=0, t=40, b=0),
-            plot_bgcolor="white", paper_bgcolor="white",
-            font=dict(family="Inter, sans-serif", size=12, color=COR_PRIMARIA),
-            yaxis=dict(autorange="reversed"),
-        )
-        st.plotly_chart(fig, use_container_width=True)
+        with col_a:
+            # ---- Heatmap semanal (dias ativos por rota) ----
+            matriz = dados_estacao.set_index("rota_label")[DIAS_SEMANA].astype(int)
+            matriz.columns = [DIAS_LABEL[d.upper()] for d in DIAS_SEMANA]
 
-        # ---- Tabela detalhada (horário, percurso, observações) ----
+            fig = go.Figure(data=go.Heatmap(
+                z=matriz.values,
+                x=matriz.columns,
+                y=matriz.index,
+                colorscale=[[0, "#F2F3F1"], [1, COR_PRIMARIA_CLARA]],
+                showscale=False,
+                xgap=4, ygap=4,
+                hovertemplate="<b>%{y}</b><br>Dia: %{x}<br>Ativo: %{z}<extra></extra>",
+            ))
+            fig.update_layout(
+                title=dict(text=f"Grade Semanal — {estacao_sel} | 每周计划", font=dict(size=14, color=COR_PRIMARIA)),
+                height=120 + 40 * len(matriz),
+                margin=dict(l=0, r=0, t=40, b=0),
+                plot_bgcolor="white", paper_bgcolor="white",
+                font=dict(family="Inter, sans-serif", size=12, color=COR_PRIMARIA),
+                yaxis=dict(autorange="reversed"),
+            )
+            st.plotly_chart(fig, use_container_width=True)
+            if tem_modo:
+                st.caption("🚛 Rodoviário&nbsp;&nbsp;&nbsp;🚢 Rodofluvial&nbsp;&nbsp;&nbsp;✈️ Aéreo", unsafe_allow_html=True)
+
+        # ---- Tempo de viagem por rota, colorido por modo de operação ----
+        if tem_tempo:
+            with col_b:
+                st.markdown('<div class="section-title">Tempo de Viagem | 运输时间</div>', unsafe_allow_html=True)
+                tempo_df = dados_estacao.dropna(subset=["tempo_viagem_horas"]).sort_values("tempo_viagem_horas")
+                cor_modo = {"RODOVIARIO": COR_PRIMARIA_CLARA, "RODOFLUVIAL": COR_ACENTO,
+                            "AEREO": "#3B9C8B", "FLUVIAL": COR_ACENTO}
+                cores = [cor_modo.get(str(m).strip().upper(), COR_TEXTO_SECUNDARIO)
+                         for m in tempo_df["modo_operacao"]]
+
+                fig2 = go.Figure(go.Bar(
+                    x=tempo_df["tempo_viagem_horas"], y=tempo_df["rota_label"], orientation="h",
+                    marker_color=cores, text=tempo_df["tempo_viagem_txt"], textposition="outside",
+                    hovertemplate="<b>%{y}</b><br>Tempo: %{text}<extra></extra>",
+                ))
+                fig2.update_layout(
+                    height=120 + 40 * len(tempo_df), margin=dict(l=0, r=30, t=10, b=0),
+                    xaxis=dict(title="Horas", showgrid=True, gridcolor="#EEF0EF"),
+                    yaxis=dict(title=""), plot_bgcolor="white", paper_bgcolor="white",
+                    font=dict(family="Inter, sans-serif", size=11, color=COR_PRIMARIA),
+                )
+                st.plotly_chart(fig2, use_container_width=True)
+
+        # ---- Tabela detalhada (horário, percurso, modo, tempo de viagem) ----
         st.markdown('<div class="section-title">Detalhamento das Rotas | 线路详情</div>', unsafe_allow_html=True)
-        tabela = dados_estacao[[
-            "rota", "tipo_operacao", "estacao_partida", "iata_percurso",
-            "horario_saida", "seg", "ter", "qua", "qui", "sex", "sab", "dom", "obs",
-        ]].rename(columns={
-            "rota": "Rota", "tipo_operacao": "Tipo Operação", "estacao_partida": "Estação Partida",
-            "iata_percurso": "IATA/Percurso", "horario_saida": "Horário Saída", "obs": "Obs",
+        colunas_tabela = ["rota", "tipo_operacao", "modo_operacao", "estacao_partida", "iata_percurso",
+                           "horario_saida", "tempo_viagem_txt", "seg", "ter", "qua", "qui", "sex", "sab", "dom"]
+        tabela = dados_estacao[colunas_tabela].rename(columns={
+            "rota": "Rota", "tipo_operacao": "Tipo Operação", "modo_operacao": "Modo Operação",
+            "estacao_partida": "Estação Partida", "iata_percurso": "IATA/Percurso",
+            "horario_saida": "Horário Saída", "tempo_viagem_txt": "Tempo de Viagem",
             "seg": "Seg", "ter": "Ter", "qua": "Qua", "qui": "Qui", "sex": "Sex", "sab": "Sáb", "dom": "Dom",
         })
         st.dataframe(tabela, use_container_width=True, hide_index=True)
