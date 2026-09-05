@@ -314,8 +314,34 @@ else:
 # ----------------------------------------------------------------------
 st.sidebar.header("🔎 Filtros | 筛选条件")
 
-meses = sorted(base["ano_mes"].dropna().unique())
-meses_sel = st.sidebar.multiselect("Mês | 月份", meses, default=meses)
+data_min = base["data"].min().date()
+data_max = base["data"].max().date()
+
+# Atalhos rápidos de período (opcional, mas evita ficar catando datas no calendário)
+col_a, col_b, col_c = st.sidebar.columns(3)
+if col_a.button("7 dias", use_container_width=True):
+    st.session_state["periodo_sel"] = (max(data_min, data_max - pd.Timedelta(days=7)), data_max)
+if col_b.button("30 dias", use_container_width=True):
+    st.session_state["periodo_sel"] = (max(data_min, data_max - pd.Timedelta(days=30)), data_max)
+if col_c.button("Tudo", use_container_width=True):
+    st.session_state["periodo_sel"] = (data_min, data_max)
+
+periodo_sel = st.sidebar.date_input(
+    "Período | 日期范围",
+    value=st.session_state.get("periodo_sel", (data_min, data_max)),
+    min_value=data_min,
+    max_value=data_max,
+    format="DD/MM/YYYY",
+    key="periodo_sel",
+)
+
+# date_input só devolve tupla de 2 quando as duas datas já foram escolhidas;
+# enquanto o usuário está selecionando (só clicou na primeira data), vem uma
+# date solta — sem esse tratamento o app quebra com ValueError ao desempacotar.
+if isinstance(periodo_sel, tuple) and len(periodo_sel) == 2:
+    data_ini, data_fim = periodo_sel
+else:
+    data_ini, data_fim = data_min, data_max
 
 rotas = sorted(base["rota"].dropna().unique())
 rotas_sel = st.sidebar.multiselect("Rota | 线路", rotas, default=rotas)
@@ -324,7 +350,8 @@ fornecedores = sorted(base["fornecedor"].dropna().unique())
 fornecedores_sel = st.sidebar.multiselect("Fornecedor | 承运商", fornecedores, default=fornecedores)
 
 df = base[
-    base["ano_mes"].isin(meses_sel)
+    (base["data"].dt.date >= data_ini)
+    & (base["data"].dt.date <= data_fim)
     & base["rota"].isin(rotas_sel)
     & base["fornecedor"].isin(fornecedores_sel)
 ]
