@@ -9,6 +9,14 @@ Como rodar:
        (ou use o botão de upload dentro do app)
     2. No terminal:  streamlit run streamlit_app.py
     3. Abre automaticamente no navegador em http://localhost:8501
+
+Mudanças desta versão:
+    - Lê TODAS as abas de cada arquivo e aceita a que tiver as colunas de custo
+      (não depende mais do nome "Custo Secundaria" — a aba agora é SET26, OUT26...)
+    - Cabeçalhos são normalizados (espaço sobrando como em "ORIGEM " não quebra)
+    - Nova coluna ORIGEM + filtro por origem na barra lateral
+    - Fretes com custo zerado não somem em silêncio: aparecem num alerta
+    - Se nenhuma aba válida for encontrada, mostra mensagem clara (sem traceback)
 """
 
 import glob
@@ -67,10 +75,10 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 INPUT_DIR = os.path.dirname(os.path.abspath(__file__))
-SHEET_NAME = "Custo Secundaria"
 
 COLUMN_MAP = {
     "序号\nNo.": "no",
+    "ORIGEM": "origem",
     "两星期      Quinzena": "quinzena",
     "日期\nData": "data",
     "任务名称\nMotivo": "motivo",
@@ -105,6 +113,19 @@ COLUMN_MAP = {
 }
 
 
+def _norm(c):
+    """Normaliza o cabeçalho: comprime espaços repetidos e tira os das pontas.
+    Ex: 'ORIGEM ' vira 'ORIGEM'. Mantém as quebras de linha (\\n)."""
+    return re.sub(r"[ \t]+", " ", str(c)).strip()
+
+
+COLUMN_MAP_NORM = {_norm(k): v for k, v in COLUMN_MAP.items()}
+
+# Uma aba só é considerada "aba de custo" se tiver TODAS estas colunas.
+# É isso que faz o app ignorar sozinho abas/arquivos de outro tipo (ex: programação).
+COLUNAS_OBRIGATORIAS = {"data", "rota", "custo_total", "km", "carga_real", "fornecedor"}
+
+
 # ----------------------------------------------------------------------
 # 2. CARGA E LIMPEZA (com cache — só reprocessa se os arquivos mudarem)
 # ----------------------------------------------------------------------
@@ -114,18 +135,25 @@ def carregar_base(arquivos: list) -> pd.DataFrame:
     ignorados = []
     for arq in arquivos:
         nome_arquivo = arq.name if hasattr(arq, "name") else os.path.basename(arq)
-        try:
-            df = pd.read_excel(arq, sheet_name=SHEET_NAME)
-        except ValueError:
-            # arquivo não tem a aba "Custo Secundaria" (ex: planilha de programação) — ignora
+        xls = pd.ExcelFile(arq)
+        aceitou = False
+
+        # Lê todas as abas: o nome da aba muda todo mês (SET26, OUT26...)
+        for aba in xls.sheet_names:
+            df = pd.read_excel(xls, sheet_name=aba)
+            df = df.rename(columns=lambda c: COLUMN_MAP_NORM.get(_norm(c), c))
+            if COLUNAS_OBRIGATORIAS - set(df.columns):
+                continue  # aba sem as colunas de custo — não é essa
+            df["arquivo_origem"] = nome_arquivo
+            df["aba_origem"] = aba
+            partes.append(df)
+            aceitou = True
+
+        if not aceitou:
             ignorados.append(nome_arquivo)
-            continue
-        df = df.rename(columns=COLUMN_MAP)
-        df["arquivo_origem"] = nome_arquivo
-        partes.append(df)
 
     if ignorados:
-        st.sidebar.caption(f"⚠️ Ignorado(s) (sem aba '{SHEET_NAME}'): {', '.join(ignorados)}")
+        st.sidebar.caption(f"⚠️ Ignorado(s) (nenhuma aba de custo): {', '.join(ignorados)}")
 
     if not partes:
         return pd.DataFrame()
@@ -134,20 +162,27 @@ def carregar_base(arquivos: list) -> pd.DataFrame:
     base["data"] = pd.to_datetime(base["data"], errors="coerce")
     base["ano_mes"] = base["data"].dt.to_period("M").astype(str)
 
+    # Arquivos antigos podem não ter a coluna ORIGEM
+    if "origem" not in base.columns:
+        base["origem"] = pd.NA
+
     # Remove espaços extras no início/fim dos campos de texto — evita que
     # "MAX LOG" e "MAX LOG " (com espaço) virem duas categorias diferentes
-    col_texto = ["fornecedor", "rota", "motorista", "setor", "modelo", "placa",
+    col_texto = ["origem", "fornecedor", "rota", "motorista", "setor", "modelo", "placa",
                  "proprio_terceiro", "tipo_transferencia", "direcao", "motivo"]
     for c in col_texto:
         if c in base.columns:
-            base[c] = base[c].astype(str).str.strip().replace({"nan": pd.NA})
+            base[c] = base[c].astype(str).str.strip().replace({"nan": pd.NA, "None": pd.NA})
+    base["origem"] = base["origem"].fillna("N/D")
 
     num_cols = ["carga_teoria", "carga_real", "volumes", "km", "custo_total",
                 "frete", "combustivel", "manutencao", "pedagio", "seguro", "outros_custos"]
     for c in num_cols:
         base[c] = pd.to_numeric(base[c], errors="coerce").fillna(0)
 
-    base = base[(base["custo_total"] > 0) & (base["rota"].notna())]
+    # Descarta só linhas sem rota ou sem data (linhas em branco da planilha).
+    # Fretes com custo ZERO são mantidos aqui — o alerta lá embaixo mostra quais são.
+    base = base[base["rota"].notna() & base["data"].notna()]
     return base
 
 
@@ -295,6 +330,16 @@ else:
 
 st.sidebar.caption(f"Fonte | 数据来源: {fonte}")
 
+# Freio: se nenhuma aba de custo foi encontrada, explica em vez de quebrar com KeyError
+if base.empty:
+    st.error(
+        "Nenhuma aba de custo válida encontrada nos arquivos.\n\n"
+        "Cada arquivo precisa ter uma aba com as colunas: **Data, Rota, Fornecedor, "
+        "KM, Carga real e Custo total** (o nome da aba pode ser qualquer um).\n\n"
+        "未找到有效的成本工作表。每个文件需包含：日期、线路、承运商、里程、实际装载量、成本费用。"
+    )
+    st.stop()
+
 # ----------------------------------------------------------------------
 # 3b. FONTE DA PROGRAMAÇÃO DE TRANSFERÊNCIA (opcional, planilha separada)
 # ----------------------------------------------------------------------
@@ -319,16 +364,18 @@ data_max = base["data"].max().date()
 
 # Atalhos rápidos de período (opcional, mas evita ficar catando datas no calendário)
 col_a, col_b, col_c = st.sidebar.columns(3)
-if col_a.button("7 dias", use_container_width=True):
+if col_a.button("7 dias", width="stretch"):
     st.session_state["periodo_sel"] = (max(data_min, data_max - pd.Timedelta(days=7)), data_max)
-if col_b.button("30 dias", use_container_width=True):
+if col_b.button("30 dias", width="stretch"):
     st.session_state["periodo_sel"] = (max(data_min, data_max - pd.Timedelta(days=30)), data_max)
-if col_c.button("Tudo", use_container_width=True):
+if col_c.button("Tudo", width="stretch"):
+    st.session_state["periodo_sel"] = (data_min, data_max)
+
+if "periodo_sel" not in st.session_state:
     st.session_state["periodo_sel"] = (data_min, data_max)
 
 periodo_sel = st.sidebar.date_input(
     "Período | 日期范围",
-    value=st.session_state.get("periodo_sel", (data_min, data_max)),
     min_value=data_min,
     max_value=data_max,
     format="DD/MM/YYYY",
@@ -343,21 +390,34 @@ if isinstance(periodo_sel, tuple) and len(periodo_sel) == 2:
 else:
     data_ini, data_fim = data_min, data_max
 
+origens = sorted(base["origem"].dropna().unique())
+origens_sel = st.sidebar.multiselect("Origem | 起点", origens, default=origens)
+
 rotas = sorted(base["rota"].dropna().unique())
 rotas_sel = st.sidebar.multiselect("Rota | 线路", rotas, default=rotas)
 
 fornecedores = sorted(base["fornecedor"].dropna().unique())
 fornecedores_sel = st.sidebar.multiselect("Fornecedor | 承运商", fornecedores, default=fornecedores)
 
-df = base[
+df_filtrado = base[
     (base["data"].dt.date >= data_ini)
     & (base["data"].dt.date <= data_fim)
+    & base["origem"].isin(origens_sel)
     & base["rota"].isin(rotas_sel)
     & base["fornecedor"].isin(fornecedores_sel)
 ]
 
-if df.empty:
+if df_filtrado.empty:
     st.warning("Nenhum registro para os filtros selecionados. | 所选筛选条件下没有记录。")
+    st.stop()
+
+# Fretes com custo zerado ficam FORA dos indicadores (distorceriam o custo por
+# pacote/km), mas são listados no alerta para ninguém perder viagem de vista.
+sem_custo = df_filtrado[df_filtrado["custo_total"] <= 0]
+df = df_filtrado[df_filtrado["custo_total"] > 0]
+
+if df.empty:
+    st.warning("Todos os fretes do filtro estão com custo zerado. | 所选记录的成本均为零。")
     st.stop()
 
 
@@ -372,6 +432,19 @@ with tab_custos:
     # ----------------------------------------------------------------------
     st.title("🚛 Relatório de Transporte Secundária | 二线运输报告")
     st.caption(f"Período | 期间: {df['data'].min().strftime('%d/%m/%Y')} a {df['data'].max().strftime('%d/%m/%Y')}")
+
+    if not sem_custo.empty:
+        st.warning(
+            f"⚠️ **{len(sem_custo)} frete(s) sem custo lançado** ficaram fora dos indicadores "
+            f"({sem_custo['carga_real'].sum():,.0f} pacotes, {sem_custo['km'].sum():,.0f} km). "
+            f"Confira se o frete ainda não foi preenchido na planilha.\n\n"
+            f"{len(sem_custo)} 条运单成本为零，未计入指标。"
+        )
+        with st.expander("Ver fretes sem custo | 查看零成本运单"):
+            cols_alerta = [c for c in ["data", "origem", "fornecedor", "rota", "km",
+                                       "carga_real", "custo_total", "obs"] if c in sem_custo.columns]
+            st.dataframe(sem_custo[cols_alerta].sort_values("data"),
+                         width="stretch", hide_index=True)
 
     custo_total = df["custo_total"].sum()
     total_km = df["km"].sum()
@@ -425,7 +498,7 @@ with tab_custos:
             coloraxis_showscale=False, plot_bgcolor="white", paper_bgcolor="white",
             font=dict(family="Inter, sans-serif", size=12, color=COR_PRIMARIA),
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     with col2:
         st.markdown('<div class="section-title">Custo por Pacote | 每包价值</div>', unsafe_allow_html=True)
@@ -459,9 +532,9 @@ with tab_custos:
                                x=0.5, y=0.5, font_size=15, showarrow=False, font_color=COR_PRIMARIA)],
             paper_bgcolor="white",
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
         with st.expander("Ver tabela | 查看表格"):
-            st.dataframe(tab_pacote, use_container_width=True)
+            st.dataframe(tab_pacote, width="stretch")
 
     with col3:
         st.markdown('<div class="section-title">Custo por KM | 每公里价值</div>', unsafe_allow_html=True)
@@ -495,9 +568,9 @@ with tab_custos:
                                x=0.5, y=0.5, font_size=15, showarrow=False, font_color=COR_PRIMARIA)],
             paper_bgcolor="white",
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
         with st.expander("Ver tabela | 查看表格"):
-            st.dataframe(tab_km, use_container_width=True)
+            st.dataframe(tab_km, width="stretch")
 
     st.divider()
 
@@ -570,19 +643,19 @@ with tab_custos:
         hovermode="x unified",
         font=dict(family="Inter, sans-serif", size=12, color=COR_PRIMARIA),
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
     with st.expander("Ver tabela mês a mês | 查看月度表格"):
         st.dataframe(
             tab_mensal.style.format({"custo_total": "R$ {:,.2f}", "variacao_pct": "{:+.1f}%"}),
-            use_container_width=True,
+            width="stretch",
         )
 
     # ----------------------------------------------------------------------
     # 8. BASE CONSOLIDADA (para conferência)
     # ----------------------------------------------------------------------
     with st.expander("📋 Ver base consolidada completa | 查看完整汇总数据"):
-        st.dataframe(df, use_container_width=True)
+        st.dataframe(df, width="stretch")
         st.download_button(
             "Baixar base consolidada (CSV) | 下载汇总数据 (CSV)",
             df.to_csv(index=False).encode("utf-8-sig"),
@@ -644,7 +717,7 @@ with tab_programacao:
                 font=dict(family="Inter, sans-serif", size=12, color=COR_PRIMARIA),
                 yaxis=dict(autorange="reversed"),
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
             if tem_modo:
                 st.caption("🚛 Rodoviário&nbsp;&nbsp;&nbsp;🚢 Rodofluvial&nbsp;&nbsp;&nbsp;✈️ Aéreo", unsafe_allow_html=True)
 
@@ -669,7 +742,7 @@ with tab_programacao:
                     yaxis=dict(title=""), plot_bgcolor="white", paper_bgcolor="white",
                     font=dict(family="Inter, sans-serif", size=11, color=COR_PRIMARIA),
                 )
-                st.plotly_chart(fig2, use_container_width=True)
+                st.plotly_chart(fig2, width="stretch")
 
         # ---- Tabela detalhada (horário, percurso, modo, tempo de viagem) ----
         st.markdown('<div class="section-title">Detalhamento das Rotas | 线路详情</div>', unsafe_allow_html=True)
@@ -681,10 +754,10 @@ with tab_programacao:
             "horario_saida": "Horário Saída", "tempo_viagem_txt": "Tempo de Viagem",
             "seg": "Seg", "ter": "Ter", "qua": "Qua", "qui": "Qui", "sex": "Sex", "sab": "Sáb", "dom": "Dom",
         })
-        st.dataframe(tabela, use_container_width=True, hide_index=True)
+        st.dataframe(tabela, width="stretch", hide_index=True)
 
         with st.expander("📋 Ver programação completa (todas as estações) | 查看完整时间表"):
-            st.dataframe(prog_df, use_container_width=True, hide_index=True)
+            st.dataframe(prog_df, width="stretch", hide_index=True)
             st.download_button(
                 "Baixar programação (CSV) | 下载时间表 (CSV)",
                 prog_df.to_csv(index=False).encode("utf-8-sig"),
